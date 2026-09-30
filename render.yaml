@@ -1,0 +1,31 @@
+# Render Blueprint — OpenFlux (Python) exit node (cupsonline transport, L4).
+#
+# Deploy:
+#   1. Push this repo to your GitHub, then in Render: New + -> Blueprint.
+#   2. Set ENCRYPTION_KEY in the service Environment (a long random string; the
+#      SAME value must go to your local client's key file).
+#   3. Deploy. The exit prints a base64 room list to the logs and also serves it
+#      at GET /rooms, so the client can fetch it with ROOMS_URL.
+#   4. Run the local client: --transport cupsonline --url "<that base64>"
+#      (or set ROOMS_URL=https://<app>.onrender.com/rooms).
+#
+# The exit needs no inbound port for cupsonline; the health endpoint on $PORT
+# only satisfies Render's port scan.
+services:
+  - type: web
+    name: openflux-py-exit
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: ROLE
+        value: exit-node
+      - key: TRANSPORT
+        value: cupsonline
+      - key: DEBUG
+        value: "0"
+      - key: ENCRYPTION_KEY
+        sync: false

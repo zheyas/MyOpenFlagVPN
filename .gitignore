@@ -1,0 +1,11 @@
+.venv/
+*idea*
+__pycache__/
+*.pyc
+.env
+.env.local
+secret.txt
+*.conf
+cookies-*.json
+render-rooms.txt
+.DS_Store

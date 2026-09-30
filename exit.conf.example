@@ -1,0 +1,10 @@
+[Interface]
+Role = exit
+Mode = l4
+EncryptionKeyFile = secret.txt
+URL = openflux-local-test
+Debug = true
+
+[Transport "direct"]
+Priority = 100
+Listen = 127.0.0.1:8445

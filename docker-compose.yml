@@ -1,0 +1,40 @@
+# OpenFlux (Python) local runner. Two independent services; start only the
+# end you need. The two ends never talk directly — they meet on the transport
+# channel (cups.online rooms / a document / a MAX call).
+#
+#   docker compose --profile client    up -d --build   # SOCKS5 on 127.0.0.1:1080
+#   docker compose --profile exit-node up -d --build
+#
+# Configure via .env (see .env.example) or inline env vars.
+
+services:
+  client:
+    build: .
+    image: openflux-py:local
+    restart: unless-stopped
+    profiles: [client]
+    environment:
+      ROLE: client
+      TRANSPORT: ${TRANSPORT:-cupsonline}
+      DOC_URL: ${DOC_URL:-}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      MAX_TOKEN: ${MAX_TOKEN:-}
+      MAX_UID: ${MAX_UID:-}
+      SOCKS5_LISTEN: ${SOCKS5_LISTEN:-:1080}
+      DEBUG: ${DEBUG:-0}
+    ports:
+      - "127.0.0.1:1080:1080"
+
+  exit-node:
+    build: .
+    image: openflux-py:local
+    restart: unless-stopped
+    profiles: [exit-node]
+    environment:
+      ROLE: exit-node
+      TRANSPORT: ${TRANSPORT:-cupsonline}
+      DOC_URL: ${DOC_URL:-}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      MAX_TOKEN: ${MAX_TOKEN:-}
+      MAX_UID: ${MAX_UID:-}
+      DEBUG: ${DEBUG:-0}

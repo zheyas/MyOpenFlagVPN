@@ -1,0 +1,15 @@
+# OpenFlux (Python port) runtime dependencies.
+#
+# Core transports (direct, cupsonline) and the crypto/codec layers need only
+# the first three. The Yandex/Mail.ru document transports add aiohttp; the MAX
+# (oneme) transport additionally needs aiortc for the WebRTC data channel.
+
+aiohttp>=3.9            # async HTTP client + WebSocket + shared cookie jar
+zstandard>=0.22         # batched codec (matches Go klauspost/compress/zstd)
+cryptography>=42.0      # AES-256-GCM for the EncryptedTransport wrapper
+
+# oneme (MAX / VK) transport only — used to decompress the call config (vcp).
+# The Go client ships with useICEInjection=true, so data rides the call
+# signaling channel and no WebRTC/aiortc stack is needed. Install only if you
+# use --transport=oneme:  pip install lz4
+lz4>=4.0 ; python_version >= "3.8"
