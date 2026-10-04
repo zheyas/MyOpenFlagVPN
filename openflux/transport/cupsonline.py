@@ -52,13 +52,20 @@ class CupsConfig:
     reconnect_multiplier: float = 1.3
     batch_max_packets: int = 256
     batch_max_bytes: int = 11000
-    max_message_data: int = 4096
+    # Bytes of codec data per cups message. The server relays a cursor array of
+    # ~1000 integers verbatim (6 bytes each), and probing showed ~21 KB passes;
+    # 11000 holds a full ~9 KB batched+encrypted frame in ONE paced message
+    # instead of splitting it across two (which halved throughput at 4096).
+    max_message_data: int = 11000
     batch_timeout: float = 0.002
     send_interval: float = 0.018
     send_queue_size: int = 1024
     max_message_bytes: int = 8 << 20
     max_payload_bytes: int = 65535
-    num_rooms: int = 4
+    # More rooms = more parallel channels = higher throughput, at the cost of a
+    # slower start (each room is a couple of round trips) and more load on the
+    # account/IP. Tunable via OPENFLUX_CUPS_ROOMS (applied in the transport).
+    num_rooms: int = 8
     room_create_pause: float = 0.5
 
 
@@ -516,6 +523,13 @@ class CupsonlineTransport(BaseTransport):
     def __init__(self, raw_url: str, config: TransportConfig, is_client: bool) -> None:
         super().__init__(config)
         self._cfg = CupsConfig()
+        import os
+        try:
+            n = int(os.getenv("OPENFLUX_CUPS_ROOMS", str(self._cfg.num_rooms)))
+            if n > 0:
+                self._cfg.num_rooms = n
+        except ValueError:
+            pass
         self._is_client = is_client
         self._room_ids = parse_room_list(raw_url)
         self._wss: List[_CupsWS] = []

@@ -18,10 +18,13 @@ from . import framing
 from .base import ReceiveCallback, Transport, TransportStats
 from .. import logging_util as log
 
-DEFAULT_MAX_BATCH_BYTES = 8192
+# A batch is sized to fit, after encryption framing, inside one cups.online
+# paced message (see cupsonline.max_message_data) so a mux segment is never
+# split across two paced sends. ~9 KiB payload + crypto overhead stays < 11 KiB.
+DEFAULT_MAX_BATCH_BYTES = 9000
 DEFAULT_MAX_BATCH_COUNT = 64
 DEFAULT_LINGER_MS = 5
-BATCH_QUEUE_DEPTH = 256
+BATCH_QUEUE_DEPTH = 1024
 
 
 def _env_int(name: str, default: int) -> int:
