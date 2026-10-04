@@ -9,3 +9,4 @@ secret.txt
 cookies-*.json
 render-rooms.txt
 .DS_Store
+.env.server

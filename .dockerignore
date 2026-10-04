@@ -1,0 +1,26 @@
+# Keep the build context lean: only the openflux package + requirements are
+# needed to build the image.
+.git
+.gitignore
+.idea
+.claude
+.venv
+
+# Python caches / build artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Local config & secrets — never belong in the image.
+.env
+.env.local
+.env.server
+secret.txt
+*.conf
+cookies-*.json
+render-rooms.txt
+
+# Docs
+README.md

@@ -1,0 +1,35 @@
+Third-Party Licenses
+====================
+
+This project (the Python port of OpenFlux) depends on the following
+third-party software. The original copyright notices and licenses apply.
+
+------------------------------------------------------------------------------
+aiohttp
+https://github.com/aio-libs/aiohttp
+Copyright aio-libs contributors.
+Licensed under the Apache License 2.0.
+
+------------------------------------------------------------------------------
+zstandard (python-zstandard)
+https://github.com/indygreg/python-zstandard
+Copyright (c) Gregory Szorc.
+Licensed under the BSD 3-Clause License.
+Wraps Zstandard (https://github.com/facebook/zstd), Copyright (c) Meta
+Platforms, Inc., dual-licensed under BSD / GPLv2.
+
+------------------------------------------------------------------------------
+cryptography (pyca/cryptography)
+https://github.com/pyca/cryptography
+Copyright (c) Individual contributors.
+Dual-licensed under Apache License 2.0 and BSD 3-Clause.
+
+------------------------------------------------------------------------------
+lz4 (python-lz4, optional — only for the oneme/MAX transport)
+https://github.com/python-lz4/python-lz4
+Copyright (c) Jonathan Underwood.
+Licensed under the BSD 3-Clause License.
+
+------------------------------------------------------------------------------
+This program itself is distributed under the GNU General Public License v3.0
+or later. See LICENSE and COPYRIGHT.
