@@ -52,7 +52,11 @@ class CupsConfig:
     reconnect_multiplier: float = 1.3
     batch_max_packets: int = 256
     batch_max_bytes: int = 11000
-    max_message_data: int = 4096
+    # Bytes of codec data per cups message. The server relays a cursor array of
+    # ~1000 integers verbatim (6 bytes each), and probing showed ~21 KB passes;
+    # 11000 holds a full ~9 KB batched+encrypted frame in ONE paced message
+    # instead of splitting it across two (which halved throughput at 4096).
+    max_message_data: int = 11000
     batch_timeout: float = 0.002
     send_interval: float = 0.018
     send_queue_size: int = 1024
