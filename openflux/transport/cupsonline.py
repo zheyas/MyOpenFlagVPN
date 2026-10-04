@@ -62,7 +62,10 @@ class CupsConfig:
     send_queue_size: int = 1024
     max_message_bytes: int = 8 << 20
     max_payload_bytes: int = 65535
-    num_rooms: int = 4
+    # More rooms = more parallel channels = higher throughput, at the cost of a
+    # slower start (each room is a couple of round trips) and more load on the
+    # account/IP. Tunable via OPENFLUX_CUPS_ROOMS (applied in the transport).
+    num_rooms: int = 8
     room_create_pause: float = 0.5
 
 
@@ -520,6 +523,13 @@ class CupsonlineTransport(BaseTransport):
     def __init__(self, raw_url: str, config: TransportConfig, is_client: bool) -> None:
         super().__init__(config)
         self._cfg = CupsConfig()
+        import os
+        try:
+            n = int(os.getenv("OPENFLUX_CUPS_ROOMS", str(self._cfg.num_rooms)))
+            if n > 0:
+                self._cfg.num_rooms = n
+        except ValueError:
+            pass
         self._is_client = is_client
         self._room_ids = parse_room_list(raw_url)
         self._wss: List[_CupsWS] = []
