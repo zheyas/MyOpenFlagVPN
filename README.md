@@ -124,3 +124,25 @@ the batched+zstd codec, and AES-256-GCM. The Yandex (`yandex`/`vyandex`/
 signaling flows but require live public documents / MAX accounts to exercise,
 which were not available during the port — treat them as untested against the
 live services.
+
+## Desktop client (ChortVPN, Kivy)
+
+A desktop GUI for clients lives in `chortvpn/`. One big power button runs the
+whole client flow: fetch the room list from the exit's `/rooms`, join the
+transport channels, start the local SOCKS5, probe the exit end to end, and
+point the system SOCKS proxy at it (macOS `networksetup`, Windows WinINet,
+GNOME `gsettings`; can be turned off in Settings). Pressing again unwinds it.
+
+```sh
+pip install -r requirements-desktop.txt
+./run-desktop.sh            # or: python -m chortvpn
+```
+
+Settings (exit address, encryption key, port, transport) are stored in the
+per-user Kivy data dir; on first launch they are seeded from `./.env`.
+Fonts: drop `Eczar-Bold.ttf` / `DMSans-*.ttf` into `chortvpn/assets/fonts/`
+to match the concept exactly; otherwise Georgia + Roboto are used.
+
+Registration is built but disabled until production
+(`REGISTRATION_ENABLED` in `chortvpn/settings.py`); `CHORTVPN_REGISTRATION=1`
+shows the still-inactive form for preview.
