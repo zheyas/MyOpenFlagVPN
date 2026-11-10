@@ -143,6 +143,15 @@ per-user Kivy data dir; on first launch they are seeded from `./.env`.
 Fonts: drop `Eczar-Bold.ttf` / `DMSans-*.ttf` into `chortvpn/assets/fonts/`
 to match the concept exactly; otherwise Georgia + Roboto are used.
 
+If the exit's address (`*.onrender.com`) is blocked on the client's network,
+the app falls back after ~7 s to the room list it saved on the last
+successful fetch (or the one pasted in Settings) and connects through
+cups.online alone. For that to keep working, the exit must stay in the same
+rooms: it pings itself to stay awake (`RENDER_EXTERNAL_URL`,
+`OPENFLUX_KEEPALIVE_SECONDS`, `OPENFLUX_KEEPALIVE_URL=off` to disable), and
+`DOC_URL` should be pinned in the Render environment to the current `/rooms`
+value so a restart does not create new rooms.
+
 Registration is built but disabled until production
 (`REGISTRATION_ENABLED` in `chortvpn/settings.py`); `CHORTVPN_REGISTRATION=1`
 shows the still-inactive form for preview.

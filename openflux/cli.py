@@ -199,6 +199,43 @@ async def _start_exit_http(addr: str, cups) -> None:
     site = web.TCPSite(runner, host, int(port))
     await site.start()
     log.infof("HTTP endpoint on %s (GET /rooms for the room list)", addr)
+    _start_keepalive()
+
+
+_bg_tasks: set = set()
+
+
+def _start_keepalive() -> None:
+    """Keep a free Render instance awake. It sleeps after ~15 min without
+    inbound HTTP, and clients on networks that block *.onrender.com can never
+    wake it (they only reach cups.online). Pinging our own public URL goes
+    through Render's edge and counts as inbound traffic.
+
+    URL: OPENFLUX_KEEPALIVE_URL, else RENDER_EXTERNAL_URL (set by Render).
+    Interval: OPENFLUX_KEEPALIVE_SECONDS (default 600). Set the URL to "off"
+    to disable."""
+    url = os.getenv("OPENFLUX_KEEPALIVE_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
+    if not url or url == "off":
+        return
+    try:
+        every = max(60.0, float(os.getenv("OPENFLUX_KEEPALIVE_SECONDS", "600")))
+    except ValueError:
+        every = 600.0
+
+    async def loop() -> None:
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=30)
+        while True:
+            await asyncio.sleep(every)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as sess:
+                    async with sess.get(url.rstrip("/") + "/healthz") as r:
+                        log.debugf("[KEEPALIVE] %s -> %d", url, r.status)
+            except Exception as e:  # noqa: BLE001 - never let this kill the exit
+                log.infof("[KEEPALIVE] ping failed: %s", e)
+
+    _bg_tasks.add(asyncio.ensure_future(loop()))   # keep a strong ref
+    log.infof("Keep-alive: pinging %s every %.0fs", url, every)
 
 
 def main(argv=None) -> None:

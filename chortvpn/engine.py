@@ -90,9 +90,14 @@ class TunnelEngine:
         self._stop_evt: Optional[asyncio.Event] = None
         self._main: Optional[asyncio.Task] = None
         self.state = OFF
+        self._used_saved = False
         # File that exists while we own the system proxy, so a crashed run can
         # be cleaned up on the next launch (see restore_proxy_if_stale).
         self.proxy_marker: Optional[str] = None
+        # Called (engine thread) with a freshly fetched room list so the GUI
+        # can remember it: the next connect then works even when the exit's
+        # HTTP endpoint (Render) is unreachable from this network.
+        self.on_rooms: Optional[Callable[[str], None]] = None
 
     # ---- public API (GUI thread) ----
     @property
@@ -154,11 +159,7 @@ class TunnelEngine:
         failed = None
         try:
             self._set(CONNECTING, "Ищем врата…")
-            url = s.doc_url
-            if s.rooms_url:
-                url = await self._fetch_rooms(s.rooms_url) or url
-            if not url and s.transport != "direct":
-                raise RuntimeError("не удалось получить список комнат выхода")
+            url = await self._resolve_rooms(s)
 
             self._set(CONNECTING, "Разжигаем каналы…")
             context = s.transport if (s.transport in ("cupsonline", "direct") or not url) else url
@@ -175,7 +176,13 @@ class TunnelEngine:
             await server.start()
 
             self._set(CONNECTING, "Проверяем выход…")
-            await self._probe(mux)
+            try:
+                await self._probe(mux)
+            except RuntimeError as e:
+                if self._used_saved:
+                    raise RuntimeError(f"{e}. Выход мог уснуть или пересоздать комнаты — "
+                                       "подключитесь один раз с доступом к адресу выхода") from None
+                raise
 
             if s.system_proxy:
                 self._mark(True)
@@ -235,10 +242,37 @@ class TunnelEngine:
             sysproxy.disable()
             self._mark(False)
 
-    async def _fetch_rooms(self, rooms_url: str, retries: int = 30, delay: float = 3.0) -> str:
+    async def _resolve_rooms(self, s: Settings) -> str:
+        """Room list to join. A fresh copy from the exit's /rooms wins; when
+        that endpoint is unreachable (e.g. *.onrender.com is blocked) fall back
+        quickly to the pinned or last-known list instead of waiting minutes."""
+        self._used_saved = False
+        known = s.doc_url or s.cached_rooms
+        if s.transport == "direct":
+            return s.doc_url
+        fetched = ""
+        if s.rooms_url:
+            if known:
+                fetched = await self._fetch_rooms(s.rooms_url, retries=1, timeout=7.0)
+            else:
+                fetched = await self._fetch_rooms(s.rooms_url)
+        if fetched:
+            if fetched != s.cached_rooms and self.on_rooms:
+                self.on_rooms(fetched)
+            return fetched
+        if known:
+            self._used_saved = bool(s.rooms_url)
+            if s.rooms_url:
+                log.infof("[GUI] exit endpoint unreachable; using the saved room list")
+            return known
+        raise RuntimeError("адрес выхода недоступен, а сохранённого списка комнат нет. "
+                           "Подключитесь один раз с доступом к нему или вставьте список в настройках")
+
+    async def _fetch_rooms(self, rooms_url: str, retries: int = 30, delay: float = 3.0,
+                           timeout: float = 20.0) -> str:
         import aiohttp
 
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=timeout)
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             for i in range(1, retries + 1):
                 try:
@@ -250,8 +284,9 @@ class TunnelEngine:
                         log.infof("[GUI] exit not ready (HTTP %d), retry %d/%d", r.status, i, retries)
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     log.infof("[GUI] exit unreachable (%s), retry %d/%d", e.__class__.__name__, i, retries)
-                self._set(CONNECTING, f"Будим выход… {i}/{retries}")
-                await asyncio.sleep(delay)
+                if i < retries:
+                    self._set(CONNECTING, f"Будим выход… {i}/{retries}")
+                    await asyncio.sleep(delay)
         return ""
 
     async def _probe(self, mux: Mux, attempts: int = 2) -> None:

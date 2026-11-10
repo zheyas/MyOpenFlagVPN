@@ -26,6 +26,7 @@ class Settings:
     transport: str = "cupsonline"
     rooms_url: str = ""          # exit's /rooms endpoint (preferred)
     doc_url: str = ""            # pinned room list / document URL (fallback)
+    cached_rooms: str = ""       # last list fetched from rooms_url (auto)
     encryption_key: str = ""
     socks_port: int = 1080
     system_proxy: bool = True    # point the OS SOCKS proxy at us while connected

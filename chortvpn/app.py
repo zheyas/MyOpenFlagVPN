@@ -832,6 +832,7 @@ class ChortApp(App):
         os.makedirs(self.user_data_dir, exist_ok=True)
         self.engine.proxy_marker = os.path.join(self.user_data_dir, "proxy.on")
         self.engine.restore_proxy_if_stale()
+        self.engine.on_rooms = self._remember_rooms
         self._log = deque(maxlen=60)
         self._log_trigger = Clock.create_trigger(self._flush_log, 0.25)
         log.add_sink(self._on_log_bg)
@@ -913,6 +914,14 @@ class ChortApp(App):
         hh, mm, ss = el // 3600, el // 60 % 60, el % 60
         self.detail_text = (f"SOCKS5 {self.settings.socks_addr} · {hh:02d}:{mm:02d}:{ss:02d}"
                             f"  ·  получено {_fmt_bytes(rx)}  ·  отправлено {_fmt_bytes(tx)}")
+
+    @mainthread
+    def _remember_rooms(self, rooms: str):
+        self.settings.cached_rooms = rooms
+        try:
+            self.store.save(self.settings)
+        except OSError as e:
+            log.errorf("[GUI] cannot save room list: %s", e)
 
     # ---------------------------------------------------------------- settings
     def _fill_settings_form(self):
