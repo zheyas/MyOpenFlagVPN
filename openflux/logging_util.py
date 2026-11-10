@@ -14,6 +14,26 @@ import time
 
 _verbose = False
 _lock = threading.Lock()
+_sinks: list = []
+
+
+def add_sink(fn) -> None:
+    """Register ``fn(level, message)`` to also receive every emitted line
+    (used by the desktop GUI to show a live log)."""
+    _sinks.append(fn)
+
+
+def remove_sink(fn) -> None:
+    if fn in _sinks:
+        _sinks.remove(fn)
+
+
+def _emit(level: str, msg: str) -> None:
+    for fn in list(_sinks):
+        try:
+            fn(level, msg)
+        except Exception:
+            pass
 
 
 def enable_debug() -> None:
@@ -40,15 +60,18 @@ def debugf(fmt: str, *args: object) -> None:
     msg = fmt % args if args else fmt
     with _lock:
         print(f"{_stamp()} [DBG] {msg}", file=sys.stderr, flush=True)
+    _emit("DBG", msg)
 
 
 def infof(fmt: str, *args: object) -> None:
     msg = fmt % args if args else fmt
     with _lock:
         print(f"{_stamp()} [INF] {msg}", file=sys.stderr, flush=True)
+    _emit("INF", msg)
 
 
 def errorf(fmt: str, *args: object) -> None:
     msg = fmt % args if args else fmt
     with _lock:
         print(f"{_stamp()} [ERR] {msg}", file=sys.stderr, flush=True)
+    _emit("ERR", msg)

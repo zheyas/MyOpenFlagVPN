@@ -11,6 +11,12 @@
 #
 # The exit needs no inbound port for cupsonline; the health endpoint on $PORT
 # only satisfies Render's port scan.
+#
+# Networks that block *.onrender.com: the client then only reaches cups.online,
+# so (a) the exit pings its own RENDER_EXTERNAL_URL every 10 min to stay awake
+# (free instances sleep after 15 min without inbound HTTP), and (b) pin DOC_URL
+# to the current room list (GET /rooms) so a restart rejoins the SAME rooms the
+# clients have saved, instead of creating new ones they cannot learn about.
 services:
   - type: web
     name: openflux-py-exit
@@ -28,4 +34,6 @@ services:
       - key: DEBUG
         value: "0"
       - key: ENCRYPTION_KEY
+        sync: false
+      - key: DOC_URL
         sync: false

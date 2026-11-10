@@ -64,6 +64,15 @@ class SOCKS5Server:
         async with self._server:
             await self._server.serve_forever()
 
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception:
+                pass
+            self._server = None
+
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             ver = (await reader.readexactly(1))[0]
