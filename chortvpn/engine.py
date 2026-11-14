@@ -298,4 +298,5 @@ class TunnelEngine:
                 return
             except Exception as e:  # noqa: BLE001
                 last = e
-        raise RuntimeError(f"выход не отвечает ({last or 'timeout'})")
+        why = "нет ответа" if isinstance(last, asyncio.TimeoutError) else (str(last) or type(last).__name__)
+        raise RuntimeError(f"выход не отвечает ({why})")
