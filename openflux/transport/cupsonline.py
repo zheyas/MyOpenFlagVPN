@@ -257,6 +257,23 @@ def _split_frame(raw: str) -> List[str]:
     return [ln.strip() for ln in raw.split("\n") if ln.strip()]
 
 
+# cups.online connection/subscription tokens are JWTs that expire (6 h as of
+# 2026-11). Reconnecting with an expired token is refused forever, so tokens
+# are refreshed by re-joining the room: proactively shortly before expiry, and
+# whenever a connection attempt fails before it became ready.
+TOKEN_REFRESH_MARGIN = 300.0   # s before exp: rotate the websocket
+
+
+def _token_exp(token: str) -> float:
+    """``exp`` claim of a JWT (unix seconds), or 0.0 if absent/unparsable."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(part)).get("exp") or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 class _CupsWS:
     def __init__(self, idx: int, room_uuid: str, cfg: CupsConfig,
                  auth: Optional[_CupsAuth], on_data) -> None:
@@ -276,6 +293,7 @@ class _CupsWS:
         self._stop = False
         self.packets_sent = 0
         self.packets_recv = 0
+        self._was_ready = False
 
     def next_id(self) -> int:
         self._rpc_id += 1
@@ -285,6 +303,11 @@ class _CupsWS:
         delay = self.cfg.reconnect_min_delay
         need_join = self.auth is None
         while not self._stop:
+            if self.auth is not None and not need_join:
+                exp = _token_exp(self.auth.conn_token)
+                if exp and exp - time.time() < TOKEN_REFRESH_MARGIN:
+                    log.debugf("[CUPS] token for %s expires soon; re-joining", self.room_uuid)
+                    need_join = True
             if need_join or self.dead:
                 try:
                     await self._join()
@@ -297,6 +320,7 @@ class _CupsWS:
                     await asyncio.sleep(delay)
                     delay = min(delay * self.cfg.reconnect_multiplier, self.cfg.reconnect_max_delay)
                     continue
+            self._was_ready = False
             try:
                 await self._connect_and_serve()
             except Exception as e:  # noqa: BLE001
@@ -304,6 +328,11 @@ class _CupsWS:
             self.connected = False
             if self._stop:
                 return
+            if self._was_ready:
+                delay = self.cfg.reconnect_min_delay   # a healthy session ended
+            else:
+                # Refused before ready: most likely stale tokens -> fresh join.
+                need_join = True
             await asyncio.sleep(delay)
             delay = min(delay * self.cfg.reconnect_multiplier, self.cfg.reconnect_max_delay)
 
@@ -332,10 +361,20 @@ class _CupsWS:
             if not await self._read_reply(ws, 2):
                 raise RuntimeError("subscribe refused")
             self.connected = True
+            self._was_ready = True
             log.debugf("[CUPS] WS ready: %s", a.room_uuid)
 
             ka = asyncio.ensure_future(self._keepalive(ws))
             sender = asyncio.ensure_future(self._send_loop(ws))
+            rotate = None
+            exp = _token_exp(a.conn_token)
+            if exp:
+                # Close shortly before the token expires; run() then re-joins
+                # for fresh tokens and reconnects (a ~1 s blip every few hours,
+                # covered by mux retransmission).
+                rotate = asyncio.get_running_loop().call_later(
+                    max(30.0, exp - time.time() - TOKEN_REFRESH_MARGIN),
+                    lambda: asyncio.ensure_future(ws.close()))
             try:
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -343,6 +382,8 @@ class _CupsWS:
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         break
             finally:
+                if rotate is not None:
+                    rotate.cancel()
                 ka.cancel()
                 sender.cancel()
                 self.ws = None

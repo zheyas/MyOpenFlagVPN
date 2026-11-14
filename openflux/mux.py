@@ -63,6 +63,8 @@ SEND_WINDOW = 256           # unacked DATA packets in flight (x MAX_SEGMENT = 1 
 RTO_INIT = 2.0
 RTO_MIN = 1.0
 RTO_MAX = 30.0
+SYN_RETRY_INIT = 1.5         # s; first SYN resend if no SYNACK yet (doubles-ish up to max)
+SYN_RETRY_MAX = 5.0
 MAX_RETRIES = 12            # give up (RST) after this many retransmits of one packet
 
 # ACK pacing. One cumulative ACK per batch of packets / per tick instead of one
@@ -149,6 +151,7 @@ class Stream:
         self._last_acked = 0
         # lifecycle
         self.closed = False
+        self._accepted = False           # exit side: SYNACK sent
         self._syn_ok = asyncio.Future()  # resolved on SYNACK / RST for the opener
         self._syn_ok.add_done_callback(lambda f: f.cancelled() or f.exception())
 
@@ -351,10 +354,32 @@ class Mux:
         self._next_id += 1
         st = Stream(self, sid)
         self._streams[sid] = st
-        self._send_raw(SYN, sid, 0, 0, encode_addr(host, port))
+        syn = encode_addr(host, port)
+        self._send_raw(SYN, sid, 0, 0, syn)
+        # The SYN is not covered by stream retransmission, and a lossy carrier
+        # (e.g. a cupsonline room still (re)connecting) can drop it: resend it
+        # with backoff until SYNACK/RST or the overall timeout. The exit
+        # ignores duplicates while dialing and re-sends SYNACK once accepted.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        interval = SYN_RETRY_INIT
         try:
-            await asyncio.wait_for(asyncio.shield(st._syn_ok), timeout=timeout)
-        except Exception:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError(f"connect {host}:{port} timed out")
+                try:
+                    await asyncio.wait_for(asyncio.shield(st._syn_ok), timeout=min(interval, remaining))
+                    break
+                except asyncio.TimeoutError:
+                    if st.closed:
+                        raise ConnectionError("stream reset while connecting") from None
+                    if deadline - loop.time() <= 0:
+                        raise
+                    log.debugf("[MUX] SYN retransmit stream %d (%s:%d)", sid, host, port)
+                    self._send_raw(SYN, sid, 0, 0, syn)
+                    interval = min(interval * 1.6, SYN_RETRY_MAX)
+        except BaseException:
             st._teardown()
             raise
         return st
@@ -426,8 +451,13 @@ class Mux:
         if not self._is_exit or self._on_stream is None:
             self._send_raw(RST, sid, 0, 0, b"")
             return
-        if sid in self._streams:
-            return  # duplicate SYN retransmit
+        dup = self._streams.get(sid)
+        if dup is not None:
+            # Duplicate SYN: the opener did not see our SYNACK yet. Still
+            # dialing -> ignore; already accepted -> the SYNACK was lost, resend.
+            if dup._accepted:
+                self._send_raw(SYNACK, sid, 0, 0, bytes([0]))
+            return
         try:
             host, port, _ = decode_addr(data)
         except Exception:  # noqa: BLE001
@@ -438,6 +468,7 @@ class Mux:
         self._on_stream(st, host, port)
 
     def accept_ok(self, st: Stream) -> None:
+        st._accepted = True
         self._send_raw(SYNACK, st.id, 0, 0, bytes([0]))
 
     def accept_fail(self, st: Stream, status: int = 1) -> None:
