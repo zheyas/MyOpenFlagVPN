@@ -62,10 +62,12 @@ class CupsConfig:
     send_queue_size: int = 1024
     max_message_bytes: int = 8 << 20
     max_payload_bytes: int = 65535
-    # More rooms = more parallel channels = higher throughput, at the cost of a
-    # slower start (each room is a couple of round trips) and more load on the
-    # account/IP. Tunable via OPENFLUX_CUPS_ROOMS (applied in the transport).
-    num_rooms: int = 8
+    # Parallel rooms (channels). More is NOT faster: measured 2026-11 with the
+    # v2 framing + mux congestion control, 4 rooms gave 20-36 KB/s and no
+    # disconnects, 8 rooms 11-12 KB/s with code-3012 drops (the relay flooding
+    # its peers). 4 is also the Go build's default. Tunable via
+    # OPENFLUX_CUPS_ROOMS (applied in the transport).
+    num_rooms: int = 4
     room_create_pause: float = 0.5
 
 
@@ -263,6 +265,24 @@ def _split_frame(raw: str) -> List[str]:
 # whenever a connection attempt fails before it became ready.
 TOKEN_REFRESH_MARGIN = 300.0   # s before exp: rotate the websocket
 
+# Chunk framing v2. cups.online silently drops relayed messages (measured
+# 0-25 %, sometimes long runs), and a batch blob larger than one message is
+# split across several. v1 chunks were bare continuations of one byte stream,
+# so a single lost message misaligned every following length prefix and fed
+# garbage "packets" upward until the buffer overflowed. v2 chunks carry a
+# per-sender sequence number and the offset of the first packet boundary in
+# the chunk, so the receiver detects a gap, drops the partial packet and
+# resumes at the next boundary; the mux retransmits what was lost.
+#   v1: >H len | data
+#   v2: >H CHUNK_V2 | >I seq | >H first (0xFFFF = no boundary) | >H len | data
+# Keep the socket's userspace write buffer short so Centrifugo's ping/pong is
+# not stuck behind megabytes of our data (the server then drops us with 3012).
+WRITE_BUFFER_LIMIT = 96 * 1024
+SOCKET_SNDBUF = 256 * 1024
+PEER_HEARD_WINDOW = 60.0      # s: send only into rooms the peer used lately
+CHUNK_V2 = 0xFFFE             # never a v1 length (max_message_data << 0xFFFE)
+NO_BOUNDARY = 0xFFFF
+
 
 def _token_exp(token: str) -> float:
     """``exp`` claim of a JWT (unix seconds), or 0.0 if absent/unparsable."""
@@ -293,7 +313,11 @@ class _CupsWS:
         self._stop = False
         self.packets_sent = 0
         self.packets_recv = 0
+        self.last_peer_rx = 0.0          # when the peer was last heard here
         self._was_ready = False
+        self._tx_seq = 0                 # v2 chunk sequence (this sender)
+        self._rx_seq: dict = {}          # sender user_uuid -> next expected seq
+        self._rx_sync = True             # False: skipping until a packet boundary
 
     def next_id(self) -> int:
         self._rpc_id += 1
@@ -353,6 +377,13 @@ class _CupsWS:
                 ws_url, headers=headers, max_msg_size=self.cfg.max_message_bytes,
                 heartbeat=None, timeout=self.cfg.ws_handshake_timeout) as ws:
             self.ws = ws
+            sock = ws.get_extra_info("socket")
+            if sock is not None:
+                try:   # cap the kernel send queue too (macOS autotunes it to MBs)
+                    import socket as _socket
+                    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDBUF, SOCKET_SNDBUF)
+                except OSError:
+                    pass
             self._recv_buf.clear()
             await ws.send_str(json.dumps({"id": 1, "connect": {"token": a.conn_token, "name": "js"}}))
             if not await self._read_reply(ws, 1):
@@ -381,6 +412,8 @@ class _CupsWS:
                         self._handle_message(msg.data)
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         break
+                log.debugf("[CUPS] ws closed (%s): code=%s %s", self.room_uuid,
+                           ws.close_code, ws.exception() or "")
             finally:
                 if rotate is not None:
                     rotate.cancel()
@@ -459,11 +492,31 @@ class _CupsWS:
             blob += struct.pack(">H", len(p))
             blob += p
         blob = bytes(blob)
+        starts = []
+        pos = 0
+        for p in batch:
+            starts.append(pos)
+            pos += 2 + len(p)
+        si = 0
         for off in range(0, len(blob), self.cfg.max_message_data):
             end = min(off + self.cfg.max_message_data, len(blob))
+            while si < len(starts) and starts[si] < off:
+                si += 1
+            first = starts[si] - off if si < len(starts) and starts[si] < end else NO_BOUNDARY
             await self._pace()
-            await self._send_chunk(ws, blob[off:end])
+            await self._wait_writable(ws)
+            await self._send_chunk(ws, blob[off:end], first)
         self.packets_sent += len(batch)
+
+    async def _wait_writable(self, ws) -> None:
+        tr = getattr(getattr(ws, "_writer", None), "transport", None)
+        if tr is None:
+            return
+        deadline = time.monotonic() + 10.0
+        while tr.get_write_buffer_size() > WRITE_BUFFER_LIMIT and time.monotonic() < deadline:
+            if ws.closed:
+                return
+            await asyncio.sleep(0.01)
 
     async def _pace(self) -> None:
         if self.cfg.send_interval <= 0:
@@ -473,8 +526,9 @@ class _CupsWS:
             await asyncio.sleep(d)
         self._last_send = time.monotonic()
 
-    async def _send_chunk(self, ws, chunk: bytes) -> None:
-        payload = struct.pack(">H", len(chunk)) + chunk
+    async def _send_chunk(self, ws, chunk: bytes, first: int = 0) -> None:
+        payload = struct.pack(">HIHH", CHUNK_V2, self._tx_seq & 0xFFFFFFFF, first, len(chunk)) + chunk
+        self._tx_seq += 1
         msg = {
             "rpc": {"method": "shared_editor_change_cursors",
                     "data": {"cursors": _cursors_from_bytes(payload), "ranges": [],
@@ -489,8 +543,10 @@ class _CupsWS:
 
     def _handle_reply(self, raw: str) -> None:
         if _is_ping(raw):
-            if self.ws:
-                asyncio.ensure_future(self.ws.send_str("{}"))
+            if self.ws and not self.ws.closed:
+                t = asyncio.ensure_future(self.ws.send_str("{}"))
+                # A pong racing a closing socket must not log "never retrieved".
+                t.add_done_callback(lambda f: f.cancelled() or f.exception())
             return
         try:
             obj = json.loads(raw)
@@ -511,6 +567,7 @@ class _CupsWS:
         cursors = payload.get("cursors", [])
         if not cursors:
             return
+        self.last_peer_rx = time.monotonic()
         nums = []
         for c in cursors:
             if not isinstance(c, dict):
@@ -525,9 +582,33 @@ class _CupsWS:
         if len(decoded) < 2:
             return
         data_len = struct.unpack_from(">H", decoded, 0)[0]
-        if 2 + data_len > len(decoded):
-            return
-        chunk = decoded[2:2 + data_len]
+        if data_len == CHUNK_V2:
+            if len(decoded) < 10:
+                return
+            seq, first, data_len = struct.unpack_from(">IHH", decoded, 2)
+            if 10 + data_len > len(decoded):
+                return
+            chunk = decoded[10:10 + data_len]
+            sender = payload.get("user_uuid")
+            expected = self._rx_seq.get(sender)
+            self._rx_seq[sender] = (seq + 1) & 0xFFFFFFFF
+            if expected is None or seq != expected:
+                # First chunk from this sender, or lost message(s): any
+                # partial packet in the buffer is junk; restart at a boundary.
+                if expected is not None:
+                    log.debugf("[CUPS] %s: chunk gap (expected %d, got %d), resyncing",
+                               self.room_uuid, expected, seq)
+                self._recv_buf.clear()
+                self._rx_sync = False
+            if not self._rx_sync:
+                if first == NO_BOUNDARY or first > len(chunk):
+                    return            # still inside a packet we lost the head of
+                chunk = chunk[first:]
+                self._rx_sync = True
+        else:
+            if 2 + data_len > len(decoded):
+                return
+            chunk = decoded[2:2 + data_len]
 
         self._recv_buf += chunk
         buf = self._recv_buf
@@ -642,18 +723,37 @@ class CupsonlineTransport(BaseTransport):
         await ws.enqueue(data)
 
     def _pick_room(self) -> Optional[_CupsWS]:
+        """Round-robin over connected rooms where the peer was heard recently;
+        if it was heard in none (start-up, or after an outage), over all
+        connected ones. This keeps traffic out of rooms the peer is not in
+        (e.g. the exit was moved to fewer rooms than a client has saved, or a
+        room silently died) without any extra signalling."""
         n = len(self._wss)
         if n == 0:
             return None
+        now = time.monotonic()
+        heard = [ws for ws in self._wss
+                 if ws.connected and now - ws.last_peer_rx <= PEER_HEARD_WINDOW]
+        pool = heard or [ws for ws in self._wss if ws.connected]
+        if not pool:
+            return None
         self._rr += 1
-        for i in range(n):
-            ws = self._wss[(self._rr + i) % n]
-            if ws.connected:
-                return ws
-        return None
+        return pool[self._rr % len(pool)]
 
     def is_connected(self) -> bool:
         return any(ws.connected for ws in self._wss)
+
+    def carrier_hosts(self) -> List[str]:
+        """Hostnames this transport talks to directly (room pages, Centrifugo
+        websockets): a full-system tunnel must route these around itself."""
+        hosts = {urlparse(BASE_ROOM_URL).hostname, "cups.online"}
+        for ws in self._wss:
+            a = ws.auth
+            if a is not None:
+                for u in (a.conn_url, a.sub_url):
+                    if u:
+                        hosts.add(urlparse(u).hostname)
+        return sorted(h for h in hosts if h)
 
     def room_list(self) -> str:
         ids = [ws.room_uuid for ws in self._wss if ws.room_uuid]

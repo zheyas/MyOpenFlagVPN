@@ -50,6 +50,7 @@ FIN = 5
 RST = 6
 UDP = 7
 KEEPALIVE = 8
+_KNOWN_TYPES = frozenset((SYN, SYNACK, DATA, ACK, FIN, RST, UDP, KEEPALIVE))
 
 _HDR = struct.Struct(">BIII")  # type, stream_id, seq, ack
 HEADER_LEN = _HDR.size
@@ -77,6 +78,26 @@ DUPACK_FAST_RETRANSMIT = 3  # duplicate ACKs that trigger a fast retransmit
 EOF = b""                   # sentinel pushed to recv queue on clean close
 
 OUT_QUEUE_DEPTH = 8192      # mux packets queued toward the transport
+
+# Congestion control, shared by all streams of a mux (AIMD, TCP-like). Without
+# it every stream pushed up to SEND_WINDOW packets as fast as the carrier took
+# them; on cupsonline the relay then queued megabytes for a slow peer, its
+# pings starved behind that queue, it dropped the websockets (code 3012 "no
+# pong") and silently lost messages, and goodput collapsed to bytes/s. The
+# window of new DATA packets in flight grows on ACKs (slow start, then +1 per
+# window) and halves on loss, at most once per CC_CUT_INTERVAL.
+CWND_INIT = 32              # packets (x MAX_SEGMENT = 128 KiB)
+CWND_MIN = 8
+CWND_MAX = 2048
+CC_CUT_INTERVAL = 1.0       # s; one multiplicative decrease per loss episode
+# Delay signal (Vegas-like): the relay's queue shows up as RTT growth before it
+# drops us, so stop growing once the smoothed RTT exceeds the baseline by
+# CC_DELAY_HOLD and back off past CC_DELAY_CUT. Baseline = min RTT over the
+# last CC_MINRTT_WINDOW seconds.
+CC_DELAY_HOLD = 1.5
+CC_DELAY_CUT = 3.0
+CC_DELAY_SLACK = 0.15       # s added to the baseline (carrier jitter)
+CC_MINRTT_WINDOW = 30.0
 
 
 # ---- address encoding (SOCKS5-style atyp) ----
@@ -184,18 +205,27 @@ class Stream:
     # ---- send machinery ----
 
     async def _pump_send(self) -> None:
+        mux = self._mux
         while self._send_buf:
-            while (self._next_seq - self._send_base) >= SEND_WINDOW:
-                self._write_wakeup.clear()
-                await self._write_wakeup.wait()
+            while True:
                 if self.closed:
                     return
+                if (self._next_seq - self._send_base) >= SEND_WINDOW:
+                    self._write_wakeup.clear()
+                    await self._write_wakeup.wait()
+                    continue
+                if mux._inflight >= mux._cwnd:
+                    mux._cc_wakeup.clear()
+                    await mux._cc_wakeup.wait()
+                    continue
+                break
             take = min(MAX_SEGMENT, len(self._send_buf))
             seg = bytes(self._send_buf[:take])
             del self._send_buf[:take]
             seq = self._next_seq
             self._next_seq += 1
             self._unacked[seq] = (seg, time.monotonic(), 0)
+            mux._inflight += 1
             self._send_packet(DATA, self.id, seq=seq, data=seg)
 
     def _send_packet(self, ptype: int, sid: int, seq: int = 0, ack: int = 0, data: bytes = b"") -> None:
@@ -217,11 +247,16 @@ class Stream:
         if ack > self._send_base:
             # New data acknowledged: advance, sampling RTT from non-retransmitted
             # packets only (Karn's algorithm).
+            acked = 0
             while self._send_base < ack:
                 entry = self._unacked.pop(self._send_base, None)
-                if entry is not None and entry[2] == 0:
-                    self._sample_rtt(now - entry[1])
+                if entry is not None:
+                    acked += 1
+                    if entry[2] == 0:
+                        self._sample_rtt(now - entry[1])
+                        self._mux._cc_rtt(now - entry[1], now)
                 self._send_base += 1
+            self._mux._cc_acked(acked)
             self._dupacks = 0
             self._last_ack_seen = ack
             if (self._next_seq - self._send_base) < SEND_WINDOW:
@@ -232,12 +267,15 @@ class Stream:
             # after a few dups instead of waiting for the RTO.
             self._dupacks += 1
             if self._dupacks == DUPACK_FAST_RETRANSMIT:
-                self._retransmit(self._send_base, now)
+                self._mux._cc_loss(now)
+                self._retransmit(self._send_base, now, timeout=False)
 
-    def _retransmit(self, seq: int, now: float) -> None:
+    def _retransmit(self, seq: int, now: float, timeout: bool = True) -> None:
         entry = self._unacked.get(seq)
         if entry is None:
             return
+        if timeout:
+            self._mux._cc_loss(now)
         data, _, retries = entry
         if retries >= MAX_RETRIES:
             log.debugf("[MUX] stream %d seq %d exceeded retries; reset", self.id, seq)
@@ -301,6 +339,9 @@ class Stream:
         if self.closed:
             return
         self.closed = True
+        if self._unacked:
+            self._mux._cc_acked(len(self._unacked), grow=False)   # no longer in flight
+            self._unacked.clear()
         if not self._got_eof:
             self._recv_q.put_nowait(EOF)
         self._write_wakeup.set()
@@ -336,7 +377,72 @@ class Mux:
         self._timer_task: Optional[asyncio.Task] = None
         self._writer_task: Optional[asyncio.Task] = None
         self._out_q: asyncio.Queue = asyncio.Queue(maxsize=OUT_QUEUE_DEPTH)
+        # congestion control (see CWND_*)
+        self._cwnd = float(CWND_INIT)
+        self._ssthresh = float(CWND_MAX)
+        self._inflight = 0
+        self._last_cut = 0.0
+        self._cc_srtt = 0.0
+        self._min_rtt = 0.0
+        self._min_rtt_at = 0.0
+        self._cc_wakeup = asyncio.Event()
         transport.set_receive(self._on_message)
+        if hasattr(transport, "add_switch_listener"):
+            transport.add_switch_listener(self._on_path_switch)
+
+    def _on_path_switch(self, old: str, new: str) -> None:
+        """Traffic moved to another carrier (multi-transport failover). What
+        was in flight on the old one is likely lost and the RTOs are inflated
+        by backoff during the outage: reset them and resend now."""
+        now = time.monotonic()
+        resent = 0
+        for st in list(self._streams.values()):
+            st._rto = min(max(st._srtt + 4 * st._rttvar, RTO_MIN), RTO_MAX) if st._srtt else RTO_INIT
+            for seq, (data, _sent, retries) in sorted(st._unacked.items()):
+                st._unacked[seq] = (data, now, retries)
+                st._send_packet(DATA, st.id, seq=seq, data=data)
+                resent += 1
+        self._cwnd = max(self._cwnd, float(CWND_INIT))
+        self._cc_wakeup.set()
+        log.infof("[MUX] path %s -> %s: resent %d packets", old, new, resent)
+
+    def _cc_acked(self, n: int, grow: bool = True) -> None:
+        if n <= 0:
+            return
+        self._inflight = max(0, self._inflight - n)
+        if grow and self._delay_ok():
+            if self._cwnd < self._ssthresh:
+                self._cwnd = min(self._cwnd + n, CWND_MAX)            # slow start
+            else:
+                self._cwnd = min(self._cwnd + n / self._cwnd, CWND_MAX)
+        self._cc_wakeup.set()
+
+    def _delay_ok(self) -> bool:
+        if not self._min_rtt or not self._cc_srtt:
+            return True
+        return self._cc_srtt <= self._min_rtt * CC_DELAY_HOLD + CC_DELAY_SLACK
+
+    def _cc_rtt(self, r: float, now: float) -> None:
+        if r <= 0:
+            return
+        if not self._min_rtt or r < self._min_rtt or now - self._min_rtt_at > CC_MINRTT_WINDOW:
+            self._min_rtt, self._min_rtt_at = r, now
+        self._cc_srtt = r if not self._cc_srtt else 0.875 * self._cc_srtt + 0.125 * r
+        if self._cc_srtt > self._min_rtt * CC_DELAY_CUT + CC_DELAY_SLACK:
+            if now - self._last_cut >= max(CC_CUT_INTERVAL, self._cc_srtt):
+                self._last_cut = now
+                self._ssthresh = max(self._cwnd * 0.7, CWND_MIN)
+                self._cwnd = self._ssthresh
+                log.debugf("[MUX] delay %.2fs (base %.2fs): cwnd -> %.0f",
+                           self._cc_srtt, self._min_rtt, self._cwnd)
+
+    def _cc_loss(self, now: float) -> None:
+        if now - self._last_cut < CC_CUT_INTERVAL:
+            return
+        self._last_cut = now
+        self._ssthresh = max(self._cwnd / 2, CWND_MIN)
+        self._cwnd = self._ssthresh
+        log.debugf("[MUX] loss: cwnd -> %.0f packets", self._cwnd)
 
     async def start(self) -> None:
         self._timer_task = asyncio.ensure_future(self._tick_loop())
@@ -413,6 +519,10 @@ class Mux:
             return
         ptype, sid, seq, ack = _HDR.unpack_from(msg)
         data = msg[HEADER_LEN:]
+        if ptype not in _KNOWN_TYPES:
+            # e.g. a multi-transport ping from a peer running several
+            # carriers: never answer unknown frames with a RST.
+            return
 
         if ptype == SYN:
             self._handle_syn(sid, data)

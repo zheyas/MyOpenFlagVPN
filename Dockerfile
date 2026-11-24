@@ -2,7 +2,10 @@
 FROM python:3.12-slim
 
 WORKDIR /app
+# iproute2 + iptables: only used by the L3 exit mode (MODE=l3, needs
+# --cap-add NET_ADMIN and /dev/net/tun; not available on Render).
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+        iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

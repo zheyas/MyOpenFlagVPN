@@ -10,3 +10,6 @@ cookies-*.json
 render-rooms.txt
 .DS_Store
 .env.server
+
+# downloaded helper binaries (tun2socks)
+chortvpn/bin/

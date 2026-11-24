@@ -26,12 +26,11 @@ from typing import Callable, Optional
 from openflux import logging_util as log
 from openflux.mux import Mux
 from openflux.socks5 import SOCKS5Server
-from openflux.transport.base import Transport, default_config
-from openflux.transport.batched import BatchedTransport
-from openflux.transport.encrypted import EncryptedTransport
-from openflux.transport.factory import make_transport
+from openflux.cli import build_transport
+from openflux.transport.base import Transport
 
 from . import sysproxy
+from .fulltunnel import FullTunnel
 from .settings import Settings
 
 OFF, CONNECTING, CONNECTED, STOPPING, ERROR = "off", "connecting", "connected", "stopping", "error"
@@ -45,6 +44,29 @@ class Stats:
     bytes_sent: int = 0
     bytes_received: int = 0
     reconnects: int = 0
+
+
+def _carrier_hosts(raws: dict, specs: list) -> list:
+    """Hosts the carriers reach directly; the full tunnel routes them around
+    itself."""
+    from urllib.parse import urlparse
+    hosts = set()
+    for raw in raws.values():
+        fn = getattr(raw, "carrier_hosts", None)
+        if fn:
+            hosts.update(fn())
+    for sp in specs:
+        u = sp.get("url") or ""
+        if sp["type"] == "direct":
+            hosts.add(u.rpartition(":")[0] or u)
+        elif u.startswith("http"):
+            hosts.add(urlparse(u).hostname or "")
+    return sorted(h for h in hosts if h)
+
+
+def _spec(ttype: str, priority: int, url: str) -> dict:
+    params = {"dial": url} if ttype == "direct" else {}
+    return {"type": ttype, "priority": priority, "url": url, "params": params}
 
 
 class _Counting(Transport):
@@ -75,6 +97,10 @@ class _Counting(Transport):
     def is_connected(self) -> bool:
         return self._inner.is_connected()
 
+    def add_switch_listener(self, fn) -> None:
+        if hasattr(self._inner, "add_switch_listener"):
+            self._inner.add_switch_listener(fn)
+
     def stats(self):
         return self._inner.stats()
 
@@ -98,6 +124,8 @@ class TunnelEngine:
         # can remember it: the next connect then works even when the exit's
         # HTTP endpoint (Render) is unreachable from this network.
         self.on_rooms: Optional[Callable[[str], None]] = None
+        # Folder for the full-tunnel helper's state files (set by the GUI).
+        self.tunnel_state_dir: Optional[str] = None
 
     # ---- public API (GUI thread) ----
     @property
@@ -154,7 +182,7 @@ class TunnelEngine:
     async def _run(self, s: Settings) -> None:
         log.set_debug(bool(s.debug))
         self._stop_evt = asyncio.Event()
-        raw = transport = mux = server = None
+        raw = transport = mux = server = tunnel = None
         proxy_on = False
         failed = None
         try:
@@ -162,11 +190,12 @@ class TunnelEngine:
             url = await self._resolve_rooms(s)
 
             self._set(CONNECTING, "Разжигаем каналы…")
-            context = s.transport if (s.transport in ("cupsonline", "direct") or not url) else url
-            params = {"dial": url} if s.transport == "direct" else {}
-            raw = make_transport(s.transport, url, default_config(), True, params)
-            transport = _Counting(EncryptedTransport(BatchedTransport(raw), s.encryption_key,
-                                                     context, exit_node=False))
+            specs = [_spec(s.transport, 100, url)]
+            if s.backup_transport and s.backup_transport != s.transport:
+                specs.append(_spec(s.backup_transport, 50, s.backup_url))
+            built, raws = build_transport(specs, s.encryption_key, True)
+            raw = raws[s.transport]
+            transport = _Counting(built)
             mux = Mux(transport, is_exit=False, on_udp=lambda *a: server and server.deliver_udp(*a))
             await transport.start()
             await mux.start()
@@ -184,7 +213,13 @@ class TunnelEngine:
                                        "подключитесь один раз с доступом к адресу выхода") from None
                 raise
 
-            if s.system_proxy:
+            if s.full_tunnel:
+                self._set(CONNECTING, "Разворачиваем полный туннель…")
+                tunnel = FullTunnel(self.tunnel_state_dir or os.path.expanduser("~/.chortvpn-tunnel"))
+                hosts = _carrier_hosts(raws, specs)
+                ips = await tunnel.up(s.socks_port, hosts)
+                log.infof("[GUI] full tunnel up; carrier bypass: %s", " ".join(ips))
+            elif s.system_proxy:
                 self._mark(True)
                 err = await asyncio.to_thread(sysproxy.enable, "127.0.0.1", s.socks_port)
                 proxy_on = True
@@ -209,6 +244,11 @@ class TunnelEngine:
             failed = str(e) or e.__class__.__name__
         finally:
             self._set(STOPPING, "Гасим пламя…")
+            if tunnel is not None:
+                try:
+                    await tunnel.down()
+                except Exception as e:  # noqa: BLE001
+                    log.errorf("[GUI] full tunnel teardown: %s", e)
             if proxy_on:
                 await asyncio.to_thread(sysproxy.disable)
                 self._mark(False)
