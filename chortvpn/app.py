@@ -653,11 +653,59 @@ KV = r"""
                                                 Line:
                                                     rounded_rectangle: self.x, self.y, self.width, self.height, dp(11)
                                                     width: 1
+                                BoxLayout:
+                                    size_hint_y: None
+                                    height: dp(76)
+                                    spacing: dp(14)
+                                    BoxLayout:
+                                        orientation: 'vertical'
+                                        spacing: dp(7)
+                                        size_hint_x: None
+                                        width: dp(200)
+                                        Label:
+                                            text: 'Запасной транспорт'
+                                            font_name: 'BodyBold'
+                                            font_size: '12sp'
+                                            color: hexa(C.muted)
+                                            size_hint_y: None
+                                            height: dp(16)
+                                            text_size: self.size
+                                            halign: 'left'
+                                        Spinner:
+                                            id: f_backup
+                                            values: ['нет'] + app.transports
+                                            text: 'нет'
+                                            font_name: 'Body'
+                                            background_normal: ''
+                                            background_down: ''
+                                            background_color: 0, 0, 0, 0
+                                            color: hexa(C.cream)
+                                            canvas.before:
+                                                Color:
+                                                    rgba: hexa('#1d1210')
+                                                RoundedRectangle:
+                                                    pos: self.pos
+                                                    size: self.size
+                                                    radius: [dp(11)]
+                                                Color:
+                                                    rgba: hexa('#ac6246', .35)
+                                                Line:
+                                                    rounded_rectangle: self.x, self.y, self.width, self.height, dp(11)
+                                                    width: 1
+                                    Field:
+                                        id: f_backup_url
+                                        title: 'Адрес документа запасного транспорта'
+                                        hint: 'на случай отказа основного'
+                                        disabled: f_backup.text == 'нет'
                                 Rule:
+                                SwitchRow:
+                                    id: f_tunnel
+                                    title: 'Полный туннель (все приложения)'
+                                    note: 'Весь трафик Mac; при подключении спросит пароль'
                                 SwitchRow:
                                     id: f_proxy
                                     title: 'Системный прокси'
-                                    note: 'Направлять трафик системы в туннель при подключении'
+                                    note: 'Без полного туннеля: браузеры и приложения с прокси'
                                 SwitchRow:
                                     id: f_debug
                                     title: 'Подробный журнал'
@@ -833,6 +881,7 @@ class ChortApp(App):
         self.engine.proxy_marker = os.path.join(self.user_data_dir, "proxy.on")
         self.engine.restore_proxy_if_stale()
         self.engine.on_rooms = self._remember_rooms
+        self.engine.tunnel_state_dir = os.path.join(self.user_data_dir, "tunnel")
         self._log = deque(maxlen=60)
         self._log_trigger = Clock.create_trigger(self._flush_log, 0.25)
         log.add_sink(self._on_log_bg)
@@ -931,7 +980,10 @@ class ChortApp(App):
         ids.f_doc.text = s.doc_url
         ids.f_port.text = str(s.socks_port)
         ids.f_transport.text = s.transport
+        ids.f_backup.text = s.backup_transport or "нет"
+        ids.f_backup_url.text = s.backup_url
         ids.f_proxy.active = s.system_proxy
+        ids.f_tunnel.active = s.full_tunnel
         ids.f_debug.active = s.debug
 
     def save_settings(self):
@@ -944,7 +996,10 @@ class ChortApp(App):
         except ValueError:
             s.socks_port = 1080
         s.transport = ids.f_transport.text or "cupsonline"
+        s.backup_transport = "" if ids.f_backup.text in ("", "нет") else ids.f_backup.text
+        s.backup_url = ids.f_backup_url.text.strip()
         s.system_proxy = bool(ids.f_proxy.active)
+        s.full_tunnel = bool(ids.f_tunnel.active)
         s.debug = bool(ids.f_debug.active)
         self.store.save(s)
         self.settings_msg = s.problems() or ""

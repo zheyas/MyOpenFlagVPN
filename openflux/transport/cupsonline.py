@@ -62,10 +62,12 @@ class CupsConfig:
     send_queue_size: int = 1024
     max_message_bytes: int = 8 << 20
     max_payload_bytes: int = 65535
-    # More rooms = more parallel channels = higher throughput, at the cost of a
-    # slower start (each room is a couple of round trips) and more load on the
-    # account/IP. Tunable via OPENFLUX_CUPS_ROOMS (applied in the transport).
-    num_rooms: int = 8
+    # Parallel rooms (channels). More is NOT faster: measured 2026-11 with the
+    # v2 framing + mux congestion control, 4 rooms gave 20-36 KB/s and no
+    # disconnects, 8 rooms 11-12 KB/s with code-3012 drops (the relay flooding
+    # its peers). 4 is also the Go build's default. Tunable via
+    # OPENFLUX_CUPS_ROOMS (applied in the transport).
+    num_rooms: int = 4
     room_create_pause: float = 0.5
 
 
@@ -277,6 +279,7 @@ TOKEN_REFRESH_MARGIN = 300.0   # s before exp: rotate the websocket
 # not stuck behind megabytes of our data (the server then drops us with 3012).
 WRITE_BUFFER_LIMIT = 96 * 1024
 SOCKET_SNDBUF = 256 * 1024
+PEER_HEARD_WINDOW = 60.0      # s: send only into rooms the peer used lately
 CHUNK_V2 = 0xFFFE             # never a v1 length (max_message_data << 0xFFFE)
 NO_BOUNDARY = 0xFFFF
 
@@ -310,6 +313,7 @@ class _CupsWS:
         self._stop = False
         self.packets_sent = 0
         self.packets_recv = 0
+        self.last_peer_rx = 0.0          # when the peer was last heard here
         self._was_ready = False
         self._tx_seq = 0                 # v2 chunk sequence (this sender)
         self._rx_seq: dict = {}          # sender user_uuid -> next expected seq
@@ -563,6 +567,7 @@ class _CupsWS:
         cursors = payload.get("cursors", [])
         if not cursors:
             return
+        self.last_peer_rx = time.monotonic()
         nums = []
         for c in cursors:
             if not isinstance(c, dict):
@@ -718,18 +723,37 @@ class CupsonlineTransport(BaseTransport):
         await ws.enqueue(data)
 
     def _pick_room(self) -> Optional[_CupsWS]:
+        """Round-robin over connected rooms where the peer was heard recently;
+        if it was heard in none (start-up, or after an outage), over all
+        connected ones. This keeps traffic out of rooms the peer is not in
+        (e.g. the exit was moved to fewer rooms than a client has saved, or a
+        room silently died) without any extra signalling."""
         n = len(self._wss)
         if n == 0:
             return None
+        now = time.monotonic()
+        heard = [ws for ws in self._wss
+                 if ws.connected and now - ws.last_peer_rx <= PEER_HEARD_WINDOW]
+        pool = heard or [ws for ws in self._wss if ws.connected]
+        if not pool:
+            return None
         self._rr += 1
-        for i in range(n):
-            ws = self._wss[(self._rr + i) % n]
-            if ws.connected:
-                return ws
-        return None
+        return pool[self._rr % len(pool)]
 
     def is_connected(self) -> bool:
         return any(ws.connected for ws in self._wss)
+
+    def carrier_hosts(self) -> List[str]:
+        """Hostnames this transport talks to directly (room pages, Centrifugo
+        websockets): a full-system tunnel must route these around itself."""
+        hosts = {urlparse(BASE_ROOM_URL).hostname, "cups.online"}
+        for ws in self._wss:
+            a = ws.auth
+            if a is not None:
+                for u in (a.conn_url, a.sub_url):
+                    if u:
+                        hosts.add(urlparse(u).hostname)
+        return sorted(h for h in hosts if h)
 
     def room_list(self) -> str:
         ids = [ws.room_uuid for ws in self._wss if ws.room_uuid]

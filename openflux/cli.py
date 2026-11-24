@@ -17,7 +17,7 @@ import asyncio
 import os
 import signal
 import sys
-from typing import Optional
+from typing import List, Optional
 
 from . import logging_util as log
 from .client import run_client
@@ -37,8 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="client | exit")
     p.add_argument("--transport", "-t", default="cupsonline",
                    help="Transport type: " + ", ".join(VALID_TRANSPORTS))
-    p.add_argument("--mode", "-m", default="l4", choices=["l4"],
-                   help="Exit mode (only l4 is available in the Python port)")
+    p.add_argument("--mode", "-m", default="l4", choices=["l4", "l3"],
+                   help="Exit mode: l4 (streams, any OS) or l3 (raw IPv4 + NAT; Linux, root, "
+                        "/dev/net/tun, iptables). An l3 exit still serves l4 clients.")
+    p.add_argument("--inbound", default="socks5", choices=["socks5", "tun"],
+                   help="Client inbound: socks5, or tun (L3: route all IPv4 into a TUN; "
+                        "needs root and an exit started with --mode l3)")
     p.add_argument("--url", "-u", default="", help="Document / room URL")
     p.add_argument("--socks5", "-s", default=":1080", help="SOCKS5 listen address (client)")
     p.add_argument("--encryption-key-file", default="",
@@ -47,14 +51,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--direct-listen", default="", help="direct: listen addr (exit)")
     p.add_argument("--oneme-token", default="", help="oneme: MAX token")
     p.add_argument("--oneme-uid", default="", help="oneme: MAX uid")
+    p.add_argument("--transports", default="",
+                   help="Several carriers with failover, e.g. cupsonline:100,direct:50")
+    for t in ("cupsonline", "yandex", "vyandex", "boards", "mailru"):
+        p.add_argument(f"--{t}-url", default="", help=f"{t}: document / room URL (sessions)")
     p.add_argument("--config", default="", help="Path to an OpenFlux .conf file")
     p.add_argument("--debug", "-d", action="store_true", help="Verbose logging")
     return p
 
 
-def _apply_conf(args: argparse.Namespace, conf: ConfFile) -> Optional[dict]:
-    """Overlay .conf [Interface] onto args (CLI wins) and return the chosen
-    single [Transport] section's params, if any."""
+def _spec_params(ttype: str, values: dict, is_exit: bool, args: argparse.Namespace) -> dict:
+    if ttype == "direct":
+        if is_exit:
+            return {"listen": values.get("Listen") or args.direct_listen}
+        return {"dial": values.get("Dial") or args.direct_dial}
+    if ttype == "oneme":
+        return {"token": values.get("Token") or args.oneme_token,
+                "uid": values.get("UID") or args.oneme_uid}
+    return {}
+
+
+def _apply_conf(args: argparse.Namespace, conf: ConfFile) -> List[dict]:
+    """Overlay .conf [Interface] onto args (CLI wins) and return one transport
+    spec per [Transport] section (empty list: use the flags)."""
     iface = conf.interface
     explicit = set(a[2:].split("=")[0].replace("-", "_") for a in sys.argv if a.startswith("--"))
 
@@ -71,95 +90,140 @@ def _apply_conf(args: argparse.Namespace, conf: ConfFile) -> Optional[dict]:
     if "Debug" in iface and "debug" not in explicit:
         args.debug = conf_bool(iface["Debug"], args.debug)
 
-    if not conf.transports:
-        return None
-    # Pick highest-priority transport section.
-    def prio(t):
+    specs = []
+    for t in conf.transports:
+        ttype = t.values.get("Type") or t.name
         try:
-            return int(t.values.get("Priority", "50"))
+            prio = int(t.values.get("Priority", "50"))
         except ValueError:
-            return 50
-    chosen = max(conf.transports, key=prio)
-    if len(conf.transports) > 1:
-        log.infof("[CONF] %d transports configured; multi-transport failover is not "
-                  "ported, using %r", len(conf.transports), chosen.name)
-    ttype = chosen.values.get("Type") or chosen.name
-    args.transport = ttype
-    if chosen.values.get("URL"):
-        args.url = chosen.values["URL"]
-    params = {}
-    if ttype == "direct":
-        if args.role == "exit":
-            params["listen"] = chosen.values.get("Listen", "")
-        else:
-            params["dial"] = chosen.values.get("Dial", "")
-    if ttype == "oneme":
-        params["token"] = chosen.values.get("Token", "")
-        params["uid"] = chosen.values.get("UID", "")
-    return params
+            prio = 50
+        specs.append({"type": ttype, "name": t.name or ttype, "priority": prio,
+                      "url": t.values.get("URL") or args.url,
+                      "params": _spec_params(ttype, t.values, args.role == "exit", args)})
+    return specs
+
+
+def _specs_from_flags(args: argparse.Namespace) -> List[dict]:
+    """--transports=cupsonline:100,direct:50 (per-type URLs from
+    --<type>-url, falling back to --url), else the single --transport."""
+    per_url = {"cupsonline": args.cupsonline_url, "yandex": args.yandex_url,
+               "vyandex": args.vyandex_url, "boards": args.boards_url, "mailru": args.mailru_url}
+    items = [x.strip() for x in (args.transports or "").split(",") if x.strip()] or [args.transport]
+    specs = []
+    for item in items:
+        name, _, prio = item.partition(":")
+        try:
+            priority = int(prio) if prio else 50
+        except ValueError:
+            priority = 50
+        specs.append({"type": name, "priority": priority,
+                      "url": per_url.get(name) or args.url,
+                      "params": _spec_params(name, {}, args.role == "exit", args)})
+    return specs
+
+
+def carrier_hosts(raws: dict, specs: List[dict]) -> List[str]:
+    """Hosts the carriers reach directly (a full tunnel routes them around
+    itself): what each transport reports, plus spec URL / dial hosts."""
+    from urllib.parse import urlparse
+    hosts = set()
+    for raw in raws.values():
+        fn = getattr(raw, "carrier_hosts", None)
+        if fn:
+            hosts.update(fn())
+    for sp in specs:
+        u = sp.get("url") or ""
+        params = sp.get("params") or {}
+        if sp["type"] == "direct":
+            d = params.get("dial") or u
+            hosts.add(d.rpartition(":")[0] or d)
+        elif u.startswith("http"):
+            hosts.add(urlparse(u).hostname or "")
+    return sorted(h for h in hosts if h)
+
+
+def build_transport(specs: List[dict], secret: str, is_client: bool):
+    """Build the carrier stack: per spec raw -> Batched -> Encrypted (if a
+    secret is set); several specs become one MultiTransport. Returns
+    (transport, raw transports by type)."""
+    from .transport.multi import Child, MultiTransport
+
+    built = []
+    raws = {}
+    for sp in specs:
+        ttype, url = sp["type"], sp.get("url") or ""
+        if ttype not in VALID_TRANSPORTS:
+            raise ValueError(f"unknown transport {ttype!r}")
+        if ttype == "direct" and not secret:
+            raise ValueError("transport direct requires an encryption key")
+        # Encryption context: the transport type, or the URL for non-cupsonline.
+        context = url if (url and ttype not in ("cupsonline", "direct")) else ttype
+        raw = make_transport(ttype, url, default_config(), is_client, sp.get("params") or {})
+        raws.setdefault(ttype, raw)
+        t = BatchedTransport(raw)
+        if secret:
+            t = EncryptedTransport(t, secret, context, exit_node=not is_client)
+        built.append((sp.get("name") or ttype, int(sp.get("priority", 50)), t))
+    if len(built) == 1:
+        return built[0][2], raws
+    return MultiTransport([Child(name=n, priority=p, transport=t) for n, p, t in built]), raws
 
 
 async def _amain(args: argparse.Namespace) -> None:
     if args.debug:
         log.enable_debug()
 
-    params: dict = {}
+    specs: List[dict] = []
     if args.config:
         conf = parse_conf(args.config)
-        params = _apply_conf(args, conf) or {}
-    # Role may come from the .conf, so resolve is_client only now.
+        specs = _apply_conf(args, conf)
+    if args.debug:
+        log.enable_debug()
     is_client = args.role == "client"
+    if not specs:
+        specs = _specs_from_flags(args)
+    for sp in specs:
+        if sp["type"] not in VALID_TRANSPORTS:
+            log.errorf("unknown transport %r", sp["type"])
+            sys.exit(2)
 
-    if args.transport not in VALID_TRANSPORTS:
-        log.errorf("unknown --transport %r", args.transport)
-        sys.exit(2)
-
-    # Transport-specific params from flags (when not from conf).
-    if args.transport == "direct" and not params:
-        params = {"dial": args.direct_dial, "listen": args.direct_listen}
-    if args.transport == "oneme" and not params:
-        params = {"token": args.oneme_token, "uid": args.oneme_uid}
-
-    # Shared secret.
     secret = ""
     if args.encryption_key_file:
         with open(args.encryption_key_file, "r", encoding="utf-8") as f:
             secret = f.read().strip()
-    if args.transport == "direct" and not secret:
-        log.errorf("--transport=direct requires --encryption-key-file")
+
+    try:
+        transport, raws = build_transport(specs, secret, is_client)
+    except ValueError as e:
+        log.errorf("%s", e)
         sys.exit(2)
 
-    # Encryption context: transport type, or the URL for non-cupsonline.
-    context = args.transport
-    if args.url and args.transport != "cupsonline":
-        context = args.url
-
-    base_cfg = default_config()
-    raw = make_transport(args.transport, args.url, base_cfg, is_client, params)
-
     log.infof("=== OpenFlux (Python) ===")
-    log.infof("Role: %s | Transport: %s | Mode: l4", args.role, args.transport)
-
-    inner = BatchedTransport(raw)
+    log.infof("Role: %s | Transport: %s | Mode: %s", args.role,
+              ", ".join(f"{sp['type']}:{sp['priority']}" for sp in specs),
+              args.mode if args.role == "exit" else args.inbound)
     if secret:
-        transport = EncryptedTransport(inner, secret, context, exit_node=not is_client)
         log.infof("Transport encryption: AES-256-GCM enabled")
-    else:
-        transport = inner
 
-    # Exit HTTP endpoint (PaaS health + cupsonline /rooms).
     if args.role == "exit":
         addr = _http_listen_addr()
         if addr:
-            await _start_exit_http(addr, raw if args.transport == "cupsonline" else None)
-
-    if args.role == "exit":
+            await _start_exit_http(addr, raws.get("cupsonline"))
         # Create the exit (installs the mux receive handler) before starting
         # the transport, so no early peer message is dropped.
         exit_node = ExitNode(transport)
+        l3 = None
+        if args.mode == "l3":
+            from .l3 import L3Exit
+            l3 = L3Exit(transport, exit_node._mux._on_message)
         await transport.start()
         await exit_node.start()
+        if l3 is not None:
+            await l3.run()
         await asyncio.Event().wait()  # run forever
+    elif args.inbound == "tun":
+        from .l3 import run_l3_client
+        await run_l3_client(transport, lambda: carrier_hosts(raws, specs))
     else:
         await run_client(transport, args.socks5)
 

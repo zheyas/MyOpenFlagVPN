@@ -155,3 +155,43 @@ value so a restart does not create new rooms.
 Registration is built but disabled until production
 (`REGISTRATION_ENABLED` in `chortvpn/settings.py`); `CHORTVPN_REGISTRATION=1`
 shows the still-inactive form for preview.
+
+## Failover, full tunnel and L3 (added 2026-11)
+
+**Several transports with failover.** Run more than one carrier at once;
+traffic uses the highest-priority one on which the peer is heard, moves to the
+next when it goes silent (8 s without any reply) and back when it recovers.
+Both sides need the same set.
+
+```sh
+python -m openflux --role exit   --transports cupsonline:100,yandex:50 --yandex-url "<doc>" ...
+python -m openflux --role client --transports cupsonline:100,yandex:50 \
+    --cupsonline-url "<rooms>" --yandex-url "<doc>" ...
+```
+
+A `.conf` with several `[Transport "name"]` sections (`Type`, `Priority`,
+`URL`, `Dial`/`Listen`) does the same; in Docker/Render set
+`TRANSPORTS=cupsonline:100,yandex:50` and `<TYPE>_URL`. The desktop app has a
+"backup transport" field. Backup carriers other than `direct` have not been
+verified against the live services yet.
+
+**cupsonline rooms.** Default is now 4 rooms (measured: 4 rooms 20–36 KB/s,
+8 rooms 11–12 KB/s with relay disconnects). Each side sends only into rooms
+where it hears the peer, so a client with a longer saved list still works.
+
+**Full tunnel on macOS (desktop app).** Settings → "Полный туннель": all IPv4
+traffic of the Mac goes through utun + tun2socks into the local SOCKS5, with
+the carrier's own hosts routed around it. Needs `chortvpn/bin/tun2socks`
+(xjasonlyu/tun2socks, not in git) and the administrator password once per
+connect; a root helper (`chortvpn/tunhelper.sh`) removes the routes on
+disconnect or if the app crashes.
+
+**L3 mode (own Linux VPS only, not Render).** The exit forwards raw IPv4
+packets through a TUN with NAT instead of re-dialing connections; it still
+serves L4 clients at the same time.
+
+```sh
+docker run --cap-add NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forward=1 \
+  -e ROLE=exit-node -e MODE=l3 -e ENCRYPTION_KEY=... -e DOC_URL=... <image>
+sudo python -m openflux --role client --inbound tun --transport cupsonline --url "<rooms>" ...
+```

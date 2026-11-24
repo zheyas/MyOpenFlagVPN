@@ -50,6 +50,7 @@ FIN = 5
 RST = 6
 UDP = 7
 KEEPALIVE = 8
+_KNOWN_TYPES = frozenset((SYN, SYNACK, DATA, ACK, FIN, RST, UDP, KEEPALIVE))
 
 _HDR = struct.Struct(">BIII")  # type, stream_id, seq, ack
 HEADER_LEN = _HDR.size
@@ -386,6 +387,24 @@ class Mux:
         self._min_rtt_at = 0.0
         self._cc_wakeup = asyncio.Event()
         transport.set_receive(self._on_message)
+        if hasattr(transport, "add_switch_listener"):
+            transport.add_switch_listener(self._on_path_switch)
+
+    def _on_path_switch(self, old: str, new: str) -> None:
+        """Traffic moved to another carrier (multi-transport failover). What
+        was in flight on the old one is likely lost and the RTOs are inflated
+        by backoff during the outage: reset them and resend now."""
+        now = time.monotonic()
+        resent = 0
+        for st in list(self._streams.values()):
+            st._rto = min(max(st._srtt + 4 * st._rttvar, RTO_MIN), RTO_MAX) if st._srtt else RTO_INIT
+            for seq, (data, _sent, retries) in sorted(st._unacked.items()):
+                st._unacked[seq] = (data, now, retries)
+                st._send_packet(DATA, st.id, seq=seq, data=data)
+                resent += 1
+        self._cwnd = max(self._cwnd, float(CWND_INIT))
+        self._cc_wakeup.set()
+        log.infof("[MUX] path %s -> %s: resent %d packets", old, new, resent)
 
     def _cc_acked(self, n: int, grow: bool = True) -> None:
         if n <= 0:
@@ -500,6 +519,10 @@ class Mux:
             return
         ptype, sid, seq, ack = _HDR.unpack_from(msg)
         data = msg[HEADER_LEN:]
+        if ptype not in _KNOWN_TYPES:
+            # e.g. a multi-transport ping from a peer running several
+            # carriers: never answer unknown frames with a RST.
+            return
 
         if ptype == SYN:
             self._handle_syn(sid, data)
