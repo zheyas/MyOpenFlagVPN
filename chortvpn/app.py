@@ -613,6 +613,10 @@ KV = r"""
                                     id: f_doc
                                     title: 'Список комнат вручную (необязательно)'
                                     hint: 'используется, если адрес выхода недоступен'
+                                Field:
+                                    id: f_mailbox
+                                    title: 'Почтовый ящик со списком комнат (ссылка Яндекс Диска)'
+                                    hint: 'https://disk.yandex.ru/d/…'
                                 BoxLayout:
                                     size_hint_y: None
                                     height: dp(76)
@@ -978,6 +982,7 @@ class ChortApp(App):
         ids.f_rooms.text = s.rooms_url
         ids.f_key.text = s.encryption_key
         ids.f_doc.text = s.doc_url
+        ids.f_mailbox.text = s.mailbox_url
         ids.f_port.text = str(s.socks_port)
         ids.f_transport.text = s.transport
         ids.f_backup.text = s.backup_transport or "нет"
@@ -990,7 +995,11 @@ class ChortApp(App):
         ids, s = self.ids, self.settings
         s.rooms_url = ids.f_rooms.text.strip()
         s.encryption_key = ids.f_key.text.strip()
-        s.doc_url = ids.f_doc.text.strip()
+        new_doc = ids.f_doc.text.strip()
+        if new_doc != s.doc_url:
+            s.cached_rooms = ""      # a freshly pasted list wins over the auto-saved one
+        s.doc_url = new_doc
+        s.mailbox_url = ids.f_mailbox.text.strip()
         try:
             s.socks_port = int(ids.f_port.text or 1080)
         except ValueError:
