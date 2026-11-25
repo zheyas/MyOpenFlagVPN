@@ -27,6 +27,7 @@ class Settings:
     rooms_url: str = ""          # exit's /rooms endpoint (preferred)
     doc_url: str = ""            # pinned room list / document URL (fallback)
     cached_rooms: str = ""       # last list fetched from rooms_url (auto)
+    mailbox_url: str = ""        # public Yandex Disk link of the exit's rooms mailbox
     backup_transport: str = ""   # optional second carrier (failover), e.g. "yandex"
     backup_url: str = ""         # its document URL / dial address
     encryption_key: str = ""

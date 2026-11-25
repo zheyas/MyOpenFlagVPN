@@ -192,6 +192,9 @@ async def _amain(args: argparse.Namespace) -> None:
         with open(args.encryption_key_file, "r", encoding="utf-8") as f:
             secret = f.read().strip()
 
+    if not is_client and secret and os.getenv("YADISK_TOKEN"):
+        await _rooms_from_mailbox(specs, secret)
+
     try:
         transport, raws = build_transport(specs, secret, is_client)
     except ValueError as e:
@@ -212,6 +215,8 @@ async def _amain(args: argparse.Namespace) -> None:
         # Create the exit (installs the mux receive handler) before starting
         # the transport, so no early peer message is dropped.
         exit_node = ExitNode(transport)
+        if raws.get("cupsonline") is not None:
+            _bg.add(asyncio.ensure_future(_exit_rooms_manager(transport, raws["cupsonline"], secret)))
         l3 = None
         if args.mode == "l3":
             from .l3 import L3Exit
@@ -238,6 +243,85 @@ def _http_listen_addr() -> str:
     return ""
 
 
+_bg: set = set()
+_MAILBOX: dict = {}
+
+
+async def _rooms_from_mailbox(specs: List[dict], secret: str) -> None:
+    """Exit start-up: rejoin the rooms our clients know (the mailbox holds the
+    latest announced list) instead of a possibly stale pinned DOC_URL."""
+    from . import rooms_sync as rs
+    try:
+        blob = await rs.read_own(os.environ["YADISK_TOKEN"])
+        if not blob:
+            return
+        rooms = rs.unseal(secret, blob)["rooms"]
+    except Exception as e:  # noqa: BLE001
+        log.errorf("[ROOMS] mailbox read failed: %s", e)
+        return
+    for sp in specs:
+        if sp["type"] == "cupsonline":
+            sp["url"] = rooms
+            log.infof("[ROOMS] rejoining the rooms from the mailbox")
+
+
+async def _exit_rooms_manager(transport, cups, secret: str) -> None:
+    """Announce the room list in-band, rotate rooms before cups.online deletes
+    them, and keep the Yandex Disk mailbox current (see rooms_sync)."""
+    import time
+    from . import rooms_sync as rs
+    token = os.getenv("YADISK_TOKEN", "")
+    try:
+        rotate_s = float(os.getenv("OPENFLUX_CUPS_ROTATE_HOURS", "72")) * 3600
+        grace_s = float(os.getenv("OPENFLUX_CUPS_ROTATE_GRACE_HOURS", "48")) * 3600
+    except ValueError:
+        rotate_s, grace_s = 72 * 3600, 48 * 3600
+    published = ""
+    next_rotate = time.monotonic() + rotate_s if rotate_s > 0 else float("inf")
+    retire_at, retire_ids = 0.0, []
+    while True:
+        try:
+            packed = cups.room_list()
+            if packed:
+                try:
+                    await transport.send(rs.announce_frame(packed))
+                except Exception:  # noqa: BLE001
+                    pass
+                if token and secret and packed != published:
+                    try:
+                        url = await rs.publish(token, rs.seal(secret, packed))
+                        published = packed
+                        if url and url != _MAILBOX.get("url"):
+                            _MAILBOX["url"] = url
+                            log.infof("[ROOMS] mailbox public link: %s", url)
+                        else:
+                            log.infof("[ROOMS] mailbox updated")
+                    except Exception as e:  # noqa: BLE001
+                        log.errorf("[ROOMS] mailbox publish failed: %s", e)
+            now = time.monotonic()
+            if now >= next_rotate:
+                if retire_ids:
+                    # A rotation came before the last overlap ended (grace >=
+                    # rotation period): finish that one first, or old rooms
+                    # would never be retired.
+                    await cups.retire_rooms(retire_ids)
+                    retire_at, retire_ids = 0.0, []
+                old = cups.live_room_ids()
+                new = await cups.add_rooms(cups._cfg.num_rooms)
+                if new:
+                    retire_ids = [r for r in old if r not in new]
+                    retire_at = now + grace_s
+                next_rotate = now + rotate_s
+            if retire_at and now >= retire_at:
+                await cups.retire_rooms(retire_ids)
+                retire_at, retire_ids = 0.0, []
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.errorf("[ROOMS] manager: %s", e)
+        await asyncio.sleep(rs.ANNOUNCE_INTERVAL)
+
+
 async def _start_exit_http(addr: str, cups) -> None:
     from aiohttp import web
 
@@ -253,7 +337,14 @@ async def _start_exit_http(addr: str, cups) -> None:
         return web.Response(text="ok\n")
 
     app = web.Application()
+    async def mailbox(request):
+        url = _MAILBOX.get("url", "")
+        if not url:
+            return web.Response(status=404, text="no mailbox (set YADISK_TOKEN on the exit)")
+        return web.Response(text=url + "\n")
+
     app.router.add_get("/rooms", rooms)
+    app.router.add_get("/mailbox", mailbox)
     app.router.add_get("/{tail:.*}", health)
     host, _, port = addr.rpartition(":")
     if host == "":

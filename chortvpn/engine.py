@@ -26,6 +26,7 @@ from typing import Callable, Optional
 from openflux import logging_util as log
 from openflux.mux import Mux
 from openflux.socks5 import SOCKS5Server
+from openflux import rooms_sync
 from openflux.cli import build_transport
 from openflux.transport.base import Transport
 
@@ -77,6 +78,8 @@ class _Counting(Transport):
         self._inner = inner
         self.sent = 0
         self.received = 0
+        # Called with a packed room list when the exit announces one in-band.
+        self.on_announce = None
 
     async def start(self) -> None:
         await self._inner.start()
@@ -91,6 +94,11 @@ class _Counting(Transport):
     def set_receive(self, cb) -> None:
         def counted(data: bytes) -> None:
             self.received += len(data)
+            rooms = rooms_sync.parse_announce(data)
+            if rooms is not None:
+                if self.on_announce:
+                    self.on_announce(rooms)
+                return
             cb(data)
         self._inner.set_receive(counted)
 
@@ -190,14 +198,39 @@ class TunnelEngine:
             url = await self._resolve_rooms(s)
 
             self._set(CONNECTING, "Разжигаем каналы…")
-            specs = [_spec(s.transport, 100, url)]
-            if s.backup_transport and s.backup_transport != s.transport:
-                specs.append(_spec(s.backup_transport, 50, s.backup_url))
-            built, raws = build_transport(specs, s.encryption_key, True)
-            raw = raws[s.transport]
-            transport = _Counting(built)
-            mux = Mux(transport, is_exit=False, on_udp=lambda *a: server and server.deliver_udp(*a))
-            await transport.start()
+            known_rooms = {"last": s.cached_rooms or url}
+
+            def announced(rooms: str) -> None:
+                if rooms and rooms != known_rooms["last"]:
+                    known_rooms["last"] = rooms
+                    log.infof("[GUI] exit announced a new room list; saved")
+                    if self.on_rooms:
+                        self.on_rooms(rooms)
+
+            for attempt in (1, 2):
+                specs = [_spec(s.transport, 100, url)]
+                if s.backup_transport and s.backup_transport != s.transport:
+                    specs.append(_spec(s.backup_transport, 50, s.backup_url))
+                built, raws = build_transport(specs, s.encryption_key, True)
+                raw = raws[s.transport]
+                transport = _Counting(built)
+                transport.on_announce = announced
+                mux = Mux(transport, is_exit=False, on_udp=lambda *a: server and server.deliver_udp(*a))
+                try:
+                    await transport.start()
+                    break
+                except RuntimeError as e:
+                    # Every saved room is gone (cups.online deleted them): get
+                    # the current list from the mailbox and try once more.
+                    if (attempt == 1 and "no rooms joined" in str(e)
+                            and s.transport == "cupsonline" and s.mailbox_url):
+                        self._set(CONNECTING, "Ищем новый список комнат…")
+                        fresh = await self._mailbox_rooms(s)
+                        if fresh and fresh != url:
+                            url = fresh
+                            announced(fresh)
+                            continue
+                    raise
             await mux.start()
 
             self._set(CONNECTING, "Открываем SOCKS5…")
@@ -242,6 +275,9 @@ class TunnelEngine:
             failed = f"порт {s.socks_port} занят" if e.errno in (48, 98, 10048) else str(e)
         except Exception as e:  # noqa: BLE001
             failed = str(e) or e.__class__.__name__
+            if "no rooms joined" in failed:
+                failed = ("комнаты cups.online устарели: выход их пересоздал. Подключитесь один раз "
+                          "с доступом к адресу выхода (например, через VPN) — новый список сохранится")
         finally:
             self._set(STOPPING, "Гасим пламя…")
             if tunnel is not None:
@@ -287,7 +323,9 @@ class TunnelEngine:
         that endpoint is unreachable (e.g. *.onrender.com is blocked) fall back
         quickly to the pinned or last-known list instead of waiting minutes."""
         self._used_saved = False
-        known = s.doc_url or s.cached_rooms
+        # The auto-updated list (exit announcements, mailbox) wins over a
+        # pasted one; pasting a new list in the settings clears it.
+        known = s.cached_rooms or s.doc_url
         if s.transport == "direct":
             return s.doc_url
         fetched = ""
@@ -305,8 +343,21 @@ class TunnelEngine:
             if s.rooms_url:
                 log.infof("[GUI] exit endpoint unreachable; using the saved room list")
             return known
+        if s.mailbox_url:
+            fresh = await self._mailbox_rooms(s)
+            if fresh:
+                if self.on_rooms:
+                    self.on_rooms(fresh)
+                return fresh
         raise RuntimeError("адрес выхода недоступен, а сохранённого списка комнат нет. "
                            "Подключитесь один раз с доступом к нему или вставьте список в настройках")
+
+    async def _mailbox_rooms(self, s: Settings) -> str:
+        try:
+            return await rooms_sync.fetch_rooms(s.mailbox_url, s.encryption_key)
+        except Exception as e:  # noqa: BLE001
+            log.errorf("[GUI] mailbox: %s", e)
+            return ""
 
     async def _fetch_rooms(self, rooms_url: str, retries: int = 30, delay: float = 3.0,
                            timeout: float = 20.0) -> str:

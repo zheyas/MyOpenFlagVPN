@@ -755,8 +755,36 @@ class CupsonlineTransport(BaseTransport):
                         hosts.add(urlparse(u).hostname)
         return sorted(h for h in hosts if h)
 
+    async def add_rooms(self, n: int) -> List[str]:
+        """Create ``n`` fresh rooms and start serving them alongside the
+        current ones (room rotation: cups.online deletes rooms after a while,
+        so the exit moves to new ones before that and announces them)."""
+        auths = await _create_rooms(n, self._cfg.room_create_pause)
+        ids = []
+        for a in auths:
+            ws = _CupsWS(len(self._wss), a.room_uuid, self._cfg, a, self.call_receive)
+            self._wss.append(ws)
+            self._tasks.append(asyncio.ensure_future(ws.run()))
+            ids.append(a.room_uuid)
+        log.infof("[CUPS] added %d fresh rooms", len(ids))
+        return ids
+
+    async def retire_rooms(self, room_ids: List[str]) -> None:
+        """Stop serving the given rooms (end of a rotation overlap)."""
+        drop = [ws for ws in self._wss if ws.room_uuid in set(room_ids)]
+        if len(drop) >= len(self._wss):
+            return                      # never retire every room
+        for ws in drop:
+            await ws.stop()
+            self._wss.remove(ws)
+        log.infof("[CUPS] retired %d old rooms", len(drop))
+
+    def live_room_ids(self) -> List[str]:
+        return [ws.room_uuid for ws in self._wss if ws.room_uuid and not ws.dead]
+
     def room_list(self) -> str:
-        ids = [ws.room_uuid for ws in self._wss if ws.room_uuid]
+        """Rooms worth joining: the live ones (dead/deleted rooms left out)."""
+        ids = self.live_room_ids() or [ws.room_uuid for ws in self._wss if ws.room_uuid]
         if ids:
             return pack_rooms(ids)
         if self._room_ids:

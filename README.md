@@ -195,3 +195,25 @@ docker run --cap-add NET_ADMIN --device /dev/net/tun --sysctl net.ipv4.ip_forwar
   -e ROLE=exit-node -e MODE=l3 -e ENCRYPTION_KEY=... -e DOC_URL=... <image>
 sudo python -m openflux --role client --inbound tun --transport cupsonline --url "<rooms>" ...
 ```
+
+## Keeping room lists current (cups.online deletes rooms)
+
+cups.online deletes rooms after a while, and a client behind a whitelist
+cannot ask the exit for the new list. Three layers handle that:
+
+1. **In-band.** The exit announces its room list over the tunnel every 30 s;
+   the app saves it. Every `OPENFLUX_CUPS_ROTATE_HOURS` (default 72; 0 = off)
+   the exit creates fresh rooms and keeps the old ones for
+   `OPENFLUX_CUPS_ROTATE_GRACE_HOURS` (default 48), so a client that connects
+   every few days always holds a working list.
+2. **Mailbox on Yandex Disk.** With `YADISK_TOKEN` set on the exit, it keeps
+   the list (AES-GCM, shared key) in a public file `chortvpn-rooms.bin` and
+   rejoins those rooms after a restart. The public link is printed in the
+   log and served at `GET /mailbox`; paste it once into the app's "mailbox"
+   setting. When all saved rooms are gone, the app downloads the list from
+   there (cloud-api.yandex.net / downloader.disk.yandex.ru).
+   Token: create an app at https://oauth.yandex.ru with the permissions
+   "cloud_api:disk.read" and "cloud_api:disk.write", then get a token for
+   your account (debug token flow) and set it as `YADISK_TOKEN` on Render.
+3. **Manual.** Paste a room list in the app's settings (it overrides the
+   auto-saved one).
